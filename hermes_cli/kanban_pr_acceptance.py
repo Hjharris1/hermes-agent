@@ -18,6 +18,8 @@ from urllib.parse import quote
 
 _REPO = re.compile(r"[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+")
 _PR = re.compile(r"https://github\.com/([A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+)/pull/([1-9][0-9]*)")
+# A GitHub App's canonical page; the slug is the only part ever placed in an endpoint.
+_APP_URL = re.compile(r"https://github\.com/apps/([a-z0-9][a-z0-9-]{0,98})")
 
 
 def validate_contract(value: str | None) -> str:
@@ -152,12 +154,16 @@ def collect_acceptance(contract: str, published_pr: str | None,
         statuses = [{**s, "sha": sha} for page in _api(f"repos/{repo}/commits/{sha}/statuses?per_page=100",
                                                        paginate=True, profile_home=profile_home) for s in page]
         outcomes = []
+        evidence: dict = {}  # one pass, one head: status contexts and app lookups are never reused across heads
         for context, app_id in sorted(required, key=str):
             matching = [r for r in runs if r["name"] == context and
                         (app_id in (None, -1) or r["app"]["id"] == app_id)]
-            # A legacy status can satisfy an unpinned context, but never a check pinned to an app.
-            legacy = [s for s in statuses if s["context"] == context] if app_id in (None, -1) else []
-            selected = matching + ([max(legacy, key=lambda s: s["id"])] if legacy else [])
+            legacy = [s for s in statuses if s["context"] == context]
+            newest = max(legacy, key=lambda s: s["id"]) if legacy else None
+            if app_id not in (None, -1) and newest is not None:
+                # A pinned context accepts a legacy status only when GitHub binds its creator to that app by ID.
+                newest = _app_bound_status(newest, app_id, repo, sha, number, evidence, profile_home)
+            selected = matching + ([newest] if newest else [])
             if not selected:
                 outcomes.append("missing")
                 receipt["checks"].append({"name": context, "classification": "missing", "head_sha": sha})
@@ -169,7 +175,8 @@ def collect_acceptance(contract: str, published_pr: str | None,
                 receipt["checks"].append({"name": context, "id": check["id"],
                     "url": check.get("html_url") or check.get("target_url"),
                     "head_sha": check.get("head_sha", check.get("sha")),
-                    "classification": classification, "conclusion": outcome})
+                    "classification": classification, "conclusion": outcome,
+                    **check.get("provenance", {})})
         # Re-read after all pages: old-head successes are never transferable.
         current = _api(f"repos/{repo}/pulls/{number}", profile_home=profile_home)
         if current["head"]["sha"] != sha or current["base"]["ref"] != branch or (current["state"] == "closed" and not current.get("merged")):
@@ -188,6 +195,44 @@ def collect_acceptance(contract: str, published_pr: str | None,
         # Never persist gh stderr (credentials/host details); the failed phase is actionable.
         receipt.update(classification="infra", detail="GitHub acceptance evidence unavailable or incomplete; check gh authentication/API access and retry.")
         return receipt
+
+
+def _app_bound_status(status: dict, app_id: int, repo: str, sha: str, number: int,
+                      evidence: dict, profile_home: str | None) -> dict | None:
+    """The newest legacy status for an app-pinned context, when its creator is provably that app.
+
+    The REST creator must be a Bot; the exact head's GraphQL StatusContext for the context must be
+    required on this PR and created by the Bot node with the same databaseId; that Bot's canonical
+    https://github.com/apps/<slug> must resolve (GET apps/<slug>) to the pinned app id. A forged or
+    other-app creator is None (missing); disagreeing evidence raises ValueError (infra), never success.
+    """
+    creator = status.get("creator") or {}
+    if creator.get("type") != "Bot" or not isinstance(creator.get("id"), int):
+        return None
+    if "contexts" not in evidence:
+        owner, name = repo.split("/")
+        query = '''{repository(owner:%s,name:%s){object(oid:%s){... on Commit{status{contexts{context state
+            isRequired(pullRequestNumber:%d) creator{__typename ... on Bot{databaseId url}}}}}}}}''' % (
+                json.dumps(owner), json.dumps(name), json.dumps(sha), number)
+        commit = (_api("graphql", query=query, profile_home=profile_home)["data"]["repository"] or {}).get("object") or {}
+        evidence["contexts"] = (commit.get("status") or {}).get("contexts")
+    contexts = evidence["contexts"]
+    entries = [c for c in contexts if c["context"] == status["context"]] if isinstance(contexts, list) else []
+    if len(entries) != 1:
+        raise ValueError("Incomplete status-context evidence")
+    entry, bot = entries[0], entries[0].get("creator") or {}
+    if bot.get("__typename") != "Bot" or bot.get("databaseId") != creator["id"] or str(entry["state"]).lower() != status["state"]:
+        raise ValueError("Status evidence changed while collecting")
+    slug = _APP_URL.fullmatch(bot.get("url") or "")
+    if entry.get("isRequired") is not True or not slug:
+        return None
+    app = evidence.setdefault("apps", {}).get(slug[1])
+    if app is None:
+        app = evidence["apps"][slug[1]] = _api(f"apps/{slug[1]}", profile_home=profile_home)
+    if app.get("id") != app_id or app.get("html_url") != bot["url"]:
+        return None
+    return {**status, "provenance": {"via": "legacy-status", "creator": creator.get("login"), "creator_id": creator["id"],
+                                     "app_slug": slug[1], "app_id": app_id}}
 
 
 def _classify(check: dict, sha: str, outcome: str | None, is_run: bool) -> str:
