@@ -1,21 +1,16 @@
 #!/usr/bin/env python3
-"""Local, read-only preview of the app-pinned completion-check fix (card t_856a2933).
+"""Local, read-only preview of the app-pinned completion-check fix.
 
-Never a gate: nothing here claims, blocks, completes or writes a card. The live board is
-only read through SQLite's backup API into a private copy. The page shows two labelled
-diagnostics, computed once at startup:
+Never a gate: nothing here claims, blocks, completes or writes a card, and every input is explicit.
 
-* Replay: GitHub's responses for one PR, captured by ``--capture`` with the AMBIENT ``gh``
-  login (a separate read-only diagnostic, never any card's gate), replayed through the
-  base collector (32a79afb, from git) and the fixed one. A response missing from the
-  capture is an honest evidence gap, never success.
-* Cards: the copied board's named cards (id, assignee, PR, state, newest recorded
-  receipt) plus the fixed collector's real gate run as that card's assignee, read-only.
-
-Serves GET / on 127.0.0.1 only; every other path is 404 and every other method 405.
-
-    python scripts/kanban_acceptance_preview.py --capture --capture-file CAPTURE.json
-    python scripts/kanban_acceptance_preview.py --capture-file CAPTURE.json --port 4123
+* ``capture --pr URL --capture-file F`` records the GitHub responses the fixed collector reads
+  for one PR, using the AMBIENT ``gh`` login: a separate read-only diagnostic, never any card's gate.
+* ``serve --base REV --board DB --cards ID [ID ...] --capture-file F`` copies the board through
+  SQLite's backup API (read-only source, private copy), runs each named card's real gate once as
+  its assignee, and replays the capture through the collector committed at the selected base
+  (resolved to one commit) and through this checkout's collector. A response missing from the
+  capture is infra, never success. One escaped page is served on 127.0.0.1: GET / only, every
+  other path 404 and every other method 405.
 """
 from __future__ import annotations
 
@@ -23,28 +18,29 @@ import argparse
 import html
 import json
 import os
+import re
 import sqlite3
 import subprocess
 import sys
 import tempfile
 import types
-from datetime import datetime, timezone
+from datetime import UTC, datetime
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 
 ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT))
 
-from hermes_cli import kanban_pr_acceptance as fixed  # noqa: E402
+from hermes_cli import kanban_pr_acceptance as fixed
 
-BASE_REV = "32a79afb"
-DEFAULT_PR = "https://github.com/Hjharris1/compound-command/pull/1429"
-DEFAULT_CARDS = ("t_e7bbc5cd", "t_e23688d6")
+COLLECTOR = "hermes_cli/kanban_pr_acceptance.py"
 HOST = "127.0.0.1"
+SCOPE_NOTE = "Evidence for the collector source change only; profile auth and card ownership are separate decisions."
+NO_PASS_NOTE = "This page shows no passing replay of the fixed collector, so it is not evidence for the change."
 
 
 def _now() -> str:
-    return datetime.now(timezone.utc).replace(microsecond=0).isoformat()
+    return datetime.now(UTC).replace(microsecond=0).isoformat()
 
 
 def copy_board(source: Path, dest_dir: Path) -> Path:
@@ -71,7 +67,7 @@ def _recorded(event) -> dict | None:
     try:
         receipt = json.loads(event[0])
         return {"classification": str(receipt["classification"]), "head_sha": receipt.get("head_sha"),
-                "at": datetime.fromtimestamp(event[1], timezone.utc).isoformat()}
+                "at": datetime.fromtimestamp(event[1], UTC).isoformat()}
     except (ValueError, KeyError, TypeError, OverflowError, OSError):
         return {"classification": "unreadable receipt", "head_sha": None, "at": None}
 
@@ -95,13 +91,37 @@ def read_cards(db: Path, ids) -> list[dict]:
         conn.close()
 
 
-def base_collector() -> types.ModuleType:
-    """The collector exactly as installed at BASE_REV, loaded from git (not emulated)."""
-    source = subprocess.run(["git", "show", f"{BASE_REV}:hermes_cli/kanban_pr_acceptance.py"], cwd=ROOT,
+def resolve_commit(rev: str) -> str:
+    """The full hash of the one commit ``rev`` names in this checkout; anything else is refused."""
+    if not rev or rev.startswith("-"):
+        raise ValueError(f"{rev!r} is not a revision")
+    result = subprocess.run(["git", "rev-parse", "--verify", "--quiet", f"{rev}^{{commit}}"], cwd=ROOT,
+                            check=False, capture_output=True, text=True, timeout=30)
+    sha = result.stdout.strip()
+    if result.returncode or not re.fullmatch(r"[0-9a-f]{40}|[0-9a-f]{64}", sha):
+        raise ValueError(f"{rev!r} does not name a commit in {ROOT}")
+    return sha
+
+
+def base_collector(rev: str) -> tuple[str, types.ModuleType]:
+    """The selected base's full hash and its collector, loaded from exactly that commit (never a path)."""
+    commit = resolve_commit(rev)
+    source = subprocess.run(["git", "show", f"{commit}:{COLLECTOR}"], cwd=ROOT,
                             check=True, capture_output=True, text=True, timeout=30).stdout
     module = types.ModuleType("kanban_pr_acceptance_base")
-    exec(compile(source, f"{BASE_REV}:hermes_cli/kanban_pr_acceptance.py", "exec"), module.__dict__)
-    return module
+    exec(compile(source, f"{commit}:{COLLECTOR}", "exec"), module.__dict__)
+    return commit, module
+
+
+def fixed_revision() -> str:
+    """HEAD's full hash for the collector imported here, flagged when that file differs from HEAD."""
+    if Path(fixed.__file__).resolve() != (ROOT / COLLECTOR).resolve():
+        raise ValueError(f"the imported collector {fixed.__file__} is not this checkout's")
+    head = resolve_commit("HEAD")
+    diff = subprocess.run(["git", "diff", "--quiet", head, "--", COLLECTOR], cwd=ROOT, check=False, capture_output=True, timeout=30)
+    if diff.returncode not in (0, 1):
+        raise ValueError("cannot compare the imported collector with HEAD")
+    return head + (" plus uncommitted collector edits" if diff.returncode else "")
 
 
 def _key(endpoint: str, query: str | None) -> str:
@@ -153,8 +173,9 @@ def _summary(receipt: dict) -> dict:
             "checks": [{k: c.get(k) for k in ("name", "classification", "via", "app_id")} for c in receipt.get("checks", [])]}
 
 
-def build_report(board: Path, saved: dict | None, cards, workdir: Path) -> dict:
-    """Copy the board, run each card's real gate as its assignee, then replay the capture through both collectors."""
+def build_report(board: Path, saved: dict | None, cards, workdir: Path, base_rev: str) -> dict:
+    """Resolve the base, copy the board, run each card's real gate as its assignee, then replay the capture."""
+    base, before = base_collector(base_rev)
     copy = copy_board(board, workdir)
     report = {"generated_at": _now(), "cards": read_cards(copy, cards), "replay": None}
     for card in report["cards"]:
@@ -162,7 +183,8 @@ def build_report(board: Path, saved: dict | None, cards, workdir: Path) -> dict:
             card["gate_now"] = _summary(fixed.collect_acceptance(card["contract"], None, assignee=card["assignee"]))
     if saved:
         report["replay"] = {"captured_at": saved.get("captured_at"), "role": saved.get("role"), "contract": saved["contract"],
-                            "before": _summary(replay(base_collector(), saved)), "after": _summary(replay(fixed, saved))}
+                            "base": base, "fixed": fixed_revision(),
+                            "before": _summary(replay(before, saved)), "after": _summary(replay(fixed, saved))}
     return report
 
 
@@ -210,36 +232,44 @@ def _card_row(card: dict) -> dict:
 
 def _replay_section(r: dict | None) -> str:
     if not r:
-        return '<p class="note">No capture loaded: there is no before/after evidence, which is not a pass.</p>'
+        return "<h2>PR evidence: none loaded</h2><p class=\"note\">No capture loaded, so there is no before/after evidence.</p>"
     pr = fixed._PR.fullmatch(r["contract"])
-    rows = [{"Collector": f"base {BASE_REV} (installed)", "Classification": r["before"]["classification"],
+    rows = [{"Collector": f"selected comparison base {r['base']}", "Classification": r["before"]["classification"],
              "Required checks": _checks(r["before"])},
-            {"Collector": "fixed (this branch)", "Classification": r["after"]["classification"], "Required checks": _checks(r["after"])}]
-    return (f'<p class="note"><strong>Replay fixture, not a live gate.</strong> GitHub responses for PR '
-            f'{html.escape("#" + pr[2] if pr else r["contract"])} were captured at {html.escape(str(r["captured_at"]))} '
-            f'by the {html.escape(str(r["role"]))}. Both collectors read the same saved responses; '
-            "a response missing from the capture shows as infra.</p>"
+            {"Collector": f"fixed revision {r['fixed']}", "Classification": r["after"]["classification"],
+             "Required checks": _checks(r["after"])}]
+    return (f'<h2>PR evidence: before and after</h2><p class="note"><strong>Replay fixture, not a live gate.</strong> '
+            f'GitHub responses for PR {html.escape("#" + pr[2] if pr else r["contract"])} were captured at '
+            f'{html.escape(str(r["captured_at"]))} by the {html.escape(str(r["role"]))}. Both collectors read the same '
+            "saved responses; a response missing from the capture shows as infra.</p>"
             + _table(f"Same saved responses, {_head(r['after']['head_sha'])}", rows))
+
+
+def _limits(report: dict, at: str) -> list[str]:
+    """Explicit limits; replay and approval wording appear only for the evidence actually loaded."""
+    r = report["replay"]
+    limits = [f"Computed once at {at}; reloading re-reads nothing. Restart the process to refresh.",
+              "Gate now is the fixed collector run once, read-only, as each card&#39;s assignee profile. "
+              "Nothing was recorded, claimed, retried or completed.",
+              f"The board is a private SQLite backup copy taken at {at} and is not served; the live board may have changed since."]
+    if r:
+        limits += ["The replay is saved evidence read by the ambient gh login, a separate read-only diagnostic. "
+                   "It is never a card&#39;s gate and completes nothing.",
+                   "The comparison base is the commit selected at startup; this page does not verify which revision is installed."]
+    return limits + [SCOPE_NOTE if r and r["after"]["classification"] == "success" else NO_PASS_NOTE]
 
 
 def render(report: dict) -> str:
     at = html.escape(report["generated_at"])
     cards = [_card_row(c) for c in report["cards"]]
-    limits = [f"Computed once at {at}; reloading re-reads nothing. Restart the process to refresh.",
-              "The replay is saved evidence read by the ambient gh login, a separate read-only diagnostic. "
-              "It is never a card&#39;s gate and completes nothing.",
-              "Gate now is the fixed collector run once, read-only, as each card&#39;s assignee profile. "
-              "Nothing was recorded, claimed, retried or completed.",
-              f"The board is a private SQLite backup copy taken at {at} and is not served; the live board may have changed since.",
-              "Approving this approves installing the source fix only. Auth config and card-owner fixes are separate decisions."]
     return ('<!doctype html><html lang="en"><head><meta charset="utf-8">'
             '<meta name="viewport" content="width=device-width,initial-scale=1">'
             f"<title>Completion-check preview</title><style>{CSS}</style></head><body><main>"
             "<h1>Completion-check fix: local read-only preview</h1>"
-            f"<h2>PR evidence: before and after</h2>{_replay_section(report['replay'])}"
-            "<h2>Cards on the copied board</h2>"
+            + _replay_section(report["replay"])
+            + "<h2>Cards on the copied board</h2>"
             + (_table(f"Gate run at {report['generated_at']}", cards) if cards else "<p>No cards requested.</p>")
-            + "<h2>Limits</h2><ul>" + "".join(f"<li>{item}</li>" for item in limits) + "</ul></main></body></html>")
+            + "<h2>Limits</h2><ul>" + "".join(f"<li>{item}</li>" for item in _limits(report, at)) + "</ul></main></body></html>")
 
 
 def make_server(page: str, port: int) -> ThreadingHTTPServer:
@@ -265,23 +295,37 @@ def make_server(page: str, port: int) -> ThreadingHTTPServer:
     return ThreadingHTTPServer((HOST, port), Handler)
 
 
-def main(argv=None) -> int:
+def _pr_url(value: str) -> str:
+    if not fixed._PR.fullmatch(value):
+        raise argparse.ArgumentTypeError("needs an exact https://github.com/OWNER/REPO/pull/N URL")
+    return value
+
+
+def parse_args(argv=None) -> argparse.Namespace:
     parser = argparse.ArgumentParser(description=__doc__.splitlines()[0])
-    parser.add_argument("--board", type=Path, default=Path.home() / ".hermes/kanban/boards/ops/kanban.db")
-    parser.add_argument("--capture-file", type=Path, required=True)
-    parser.add_argument("--capture", action="store_true", help="refresh the capture with the ambient gh login, then exit")
-    parser.add_argument("--pr", default=DEFAULT_PR)
-    parser.add_argument("--cards", default=",".join(DEFAULT_CARDS))
-    parser.add_argument("--port", type=int, default=4123)
-    args = parser.parse_args(argv)
-    if args.capture:
+    commands = parser.add_subparsers(dest="command", required=True)
+    record = commands.add_parser("capture", help="record one PR's GitHub reads with the ambient gh login, then exit")
+    record.add_argument("--pr", type=_pr_url, required=True)
+    record.add_argument("--capture-file", type=Path, required=True)
+    serve = commands.add_parser("serve", help="serve the read-only page on 127.0.0.1")
+    serve.add_argument("--base", required=True, help="comparison base revision, resolved to one commit")
+    serve.add_argument("--board", type=Path, required=True, help="kanban.db to copy; opened read-only")
+    serve.add_argument("--cards", nargs="+", required=True, metavar="TASK_ID")
+    serve.add_argument("--capture-file", type=Path, required=True)
+    serve.add_argument("--port", type=int, default=4123)
+    return parser.parse_args(argv)
+
+
+def main(argv=None) -> int:
+    args = parse_args(argv)
+    if args.command == "capture":
         args.capture_file.write_text(json.dumps(capture(args.pr)), encoding="utf-8")
         os.chmod(args.capture_file, 0o600)
         print(f"captured {args.pr} to {args.capture_file}")
         return 0
     try:
-        report = build_report(args.board, load_capture(args.capture_file), [c for c in args.cards.split(",") if c],
-                              Path(tempfile.mkdtemp(prefix="acceptance-preview-")))
+        report = build_report(args.board, load_capture(args.capture_file), args.cards,
+                              Path(tempfile.mkdtemp(prefix="acceptance-preview-")), args.base)
         server = make_server(render(report), args.port)
     except (OSError, ValueError, sqlite3.Error, subprocess.SubprocessError) as exc:
         print(f"preview not started: {exc}", file=sys.stderr)

@@ -211,9 +211,7 @@ def _app_bound_status(status: dict, app_id: int, repo: str, sha: str, number: in
         return None
     if "contexts" not in evidence:
         owner, name = repo.split("/")
-        query = '''{repository(owner:%s,name:%s){object(oid:%s){... on Commit{status{contexts{context state
-            isRequired(pullRequestNumber:%d) creator{__typename ... on Bot{databaseId url}}}}}}}}''' % (
-                json.dumps(owner), json.dumps(name), json.dumps(sha), number)
+        query = f'{{repository(owner:{json.dumps(owner)},name:{json.dumps(name)}){{object(oid:{json.dumps(sha)}){{... on Commit{{status{{contexts{{context state\n            isRequired(pullRequestNumber:{number:d}) creator{{__typename ... on Bot{{databaseId url}}}}}}}}}}}}}}}}'
         commit = (_api("graphql", query=query, profile_home=profile_home)["data"]["repository"] or {}).get("object") or {}
         evidence["contexts"] = (commit.get("status") or {}).get("contexts")
     contexts = evidence["contexts"]
